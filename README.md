@@ -12,13 +12,15 @@ axum · socketioxide (Socket.io) · sqlx (SQLite) · jsonwebtoken · bcrypt · A
 
 ```
 PORT=5000
-JWT_SECRET=akami-wtf-secret-key-12345
-DM_ENCRYPTION_KEY=akami-wtf-dm-encryption-super-secret-key-98765
+JWT_SECRET=<длинная случайная строка>
+DM_ENCRYPTION_KEY=<длинная случайная строка; по умолчанию берётся JWT_SECRET>
 DATABASE_URL=sqlite:dev.db
 ```
 
-Значения по умолчанию совпадают с Node-версией. `DATABASE_URL` можно указать на
-существующую базу — схема создаётся идемпотентно и старые данные не трогаются.
+Оба секрета должны совпадать со значениями Node-версии, иначе выданные ранее
+JWT перестанут проходить проверку, а существующие DM не расшифруются.
+`DATABASE_URL` можно указать на существующую базу — схема создаётся
+идемпотентно и старые данные не трогаются.
 
 ## Запуск
 
