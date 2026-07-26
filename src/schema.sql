@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS "User" (
     "status" TEXT NOT NULL DEFAULT 'online',
     "bio" TEXT NOT NULL DEFAULT 'Привет! Я использую Akami.',
     "pronouns" TEXT NOT NULL DEFAULT '',
+    "profileColor" TEXT NOT NULL DEFAULT '',
     "badges" TEXT NOT NULL DEFAULT '',
     "customStatus" TEXT NOT NULL DEFAULT '',
     "socials" TEXT NOT NULL DEFAULT '',

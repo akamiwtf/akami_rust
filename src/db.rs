@@ -21,7 +21,32 @@ pub async fn connect(database_url: &str) -> Result<Db, sqlx::Error> {
         .await?;
 
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+    add_missing_columns(&pool).await?;
     Ok(pool)
+}
+
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
+/// existing databases alone, so each one is added here if absent — `ADD COLUMN`
+/// errors when the column is already there, hence the pragma check.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
+    "User",
+    "profileColor",
+    r#"ALTER TABLE "User" ADD COLUMN "profileColor" TEXT NOT NULL DEFAULT ''"#,
+)];
+
+async fn add_missing_columns(pool: &Db) -> Result<(), sqlx::Error> {
+    for (table, column, ddl) in ADDED_COLUMNS {
+        let exists: Option<(i64,)> = sqlx::query_as(sql(format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"
+        )))
+        .bind(column)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_none() {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(*ddl)).execute(pool).await?;
+        }
+    }
+    Ok(())
 }
 
 /// sqlx 0.9 only accepts `&'static str` SQL; queries built with `format!`
@@ -49,6 +74,51 @@ pub fn to_db_date(dt: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::models::*;
+
+    /// A database created before `profileColor` existed must gain the column on
+    /// connect — `CREATE TABLE IF NOT EXISTS` alone would leave it behind.
+    #[tokio::test]
+    async fn adds_columns_to_an_older_database() {
+        let path = std::env::temp_dir().join(format!("akami_migr_{}.db", new_id()));
+        let url = format!("sqlite:{}", path.display());
+
+        // Stand up a User table without the newer column, as an old deploy has.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&url)
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"CREATE TABLE "User" ("id" TEXT NOT NULL PRIMARY KEY, "username" TEXT NOT NULL,
+               "email" TEXT NOT NULL, "password" TEXT NOT NULL, "updatedAt" DATETIME NOT NULL)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(r#"INSERT INTO "User" VALUES (?, 'old', 'o@x.com', 'pw', '2026-01-01')"#)
+            .bind(new_id())
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let pool = connect(&url).await.unwrap();
+        // Present, and the existing row got the default rather than NULL.
+        let (color,): (String,) = sqlx::query_as(r#"SELECT "profileColor" FROM "User""#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(color, "");
+
+        // Connecting again must not fail on the already-added column.
+        pool.close().await;
+        connect(&url).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Decode real Prisma-written rows from a copy of the original dev.db
     /// and check the JSON date format matches Prisma's output.

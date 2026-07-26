@@ -29,6 +29,7 @@ pub struct User {
     pub status: String,
     pub bio: String,
     pub pronouns: String,
+    pub profile_color: String,
     pub badges: String,
     pub custom_status: String,
     pub socials: String,
@@ -53,6 +54,7 @@ pub struct PublicUser {
     pub status: String,
     pub bio: String,
     pub pronouns: String,
+    pub profile_color: String,
     pub badges: String,
     pub custom_status: String,
     pub socials: String,
@@ -62,7 +64,7 @@ pub struct PublicUser {
 
 /// Column list matching `PublicUser`, for SELECT statements.
 pub const PUBLIC_USER_COLS: &str = "id, username, displayName, avatar, banner, status, bio, \
-    pronouns, badges, customStatus, socials, createdAt";
+    pronouns, profileColor, badges, customStatus, socials, createdAt";
 
 #[derive(Debug, Clone, FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]

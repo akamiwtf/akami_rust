@@ -23,7 +23,7 @@ pub fn e500(_: impl std::fmt::Display) -> ApiError {
 
 /// friendUserSelect / server-members / users-list / single-user shape.
 pub const API_USER_COLS: &str = "id, username, displayName, avatar, banner, status, bio, \
-    pronouns, isBot, badges, customStatus, socials, createdAt";
+    pronouns, profileColor, isBot, badges, customStatus, socials, createdAt";
 
 #[derive(Debug, Clone, FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +37,7 @@ pub struct ApiUser {
     pub status: String,
     pub bio: String,
     pub pronouns: String,
+    pub profile_color: String,
     pub is_bot: bool,
     pub badges: String,
     pub custom_status: String,
@@ -91,6 +92,7 @@ pub struct ProfileUser {
     pub status: String,
     pub bio: String,
     pub pronouns: String,
+    pub profile_color: String,
     pub badges: String,
     pub custom_status: String,
     pub socials: String,
@@ -99,7 +101,7 @@ pub struct ProfileUser {
 }
 
 pub const PROFILE_USER_COLS: &str = "id, username, displayName, email, avatar, banner, status, \
-    bio, pronouns, badges, customStatus, socials, createdAt";
+    bio, pronouns, profileColor, badges, customStatus, socials, createdAt";
 
 /// Deserializes into the JS three-state: a plain `Option<Option<T>>` collapses
 /// a missing field and an explicit `null` both to `None`; wrapping the parsed
@@ -131,6 +133,8 @@ pub struct ProfileUpdate {
     pub bio: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub pronouns: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub profile_color: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub badges: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]

@@ -113,6 +113,7 @@ pub async fn update_profile(
     set_nullable!(body.banner, "banner");
     set_nullable!(body.bio, "bio");
     set_nullable!(body.pronouns, "pronouns");
+    set_nullable!(body.profile_color, "profileColor");
     set_nullable!(body.badges, "badges");
     set_nullable!(body.custom_status, "customStatus");
     set_nullable!(body.socials, "socials");

@@ -264,6 +264,67 @@ async fn full_rest_flow() {
     assert_eq!(prof["displayName"], "Alice A");
     assert_eq!(prof["bio"], "hello");
 
+    // --- profile colour: survives the round trip, and is visible to others ---
+    let r = c
+        .put(format!("{base}/api/users/profile"))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({ "profileColor": "#ff8800" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap()["profileColor"],
+        "#ff8800"
+    );
+
+    // A re-read of the profile still has it (i.e. it was persisted, not echoed).
+    // /auth/me is what the client caches as "me", so it has to be the complete
+    // shape — a missing field there silently wipes it on the next save.
+    let r = c
+        .get(format!("{base}/api/auth/me"))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .unwrap();
+    let me: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(me["user"]["profileColor"], "#ff8800");
+    assert_eq!(me["user"]["displayName"], "Alice A");
+    for field in ["username", "email", "bio", "pronouns", "badges", "customStatus", "socials"] {
+        assert!(!me["user"][field].is_null(), "/auth/me is missing {field}");
+    }
+
+    // an unrelated profile save must not wipe the colour
+    let r = c
+        .put(format!("{base}/api/users/profile"))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({ "bio": "still orange" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap()["profileColor"],
+        "#ff8800"
+    );
+
+    // and an empty string clears it back to "follow the viewer's theme"
+    let r = c
+        .put(format!("{base}/api/users/profile"))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({ "profileColor": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()["profileColor"], "");
+
+    // put it back for the checks further down
+    c.put(format!("{base}/api/users/profile"))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({ "profileColor": "#ff8800" }))
+        .send()
+        .await
+        .unwrap();
+
     // clear displayName with explicit null
     let r = c
         .put(format!("{base}/api/users/profile"))

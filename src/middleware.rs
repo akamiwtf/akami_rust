@@ -21,12 +21,14 @@ use crate::state::AppState;
 pub struct AuthedUser {
     pub id: String,
     pub username: String,
+    pub display_name: Option<String>,
     pub email: String,
     pub avatar: Option<String>,
     pub banner: Option<String>,
     pub status: String,
     pub bio: String,
     pub pronouns: String,
+    pub profile_color: String,
     pub badges: String,
     pub custom_status: String,
     pub socials: String,
@@ -64,8 +66,8 @@ impl FromRequestParts<AppState> for AuthedUser {
         };
 
         let user: Option<AuthedUser> = sqlx::query_as(
-            "SELECT id, username, email, avatar, banner, status, bio, pronouns, \
-             badges, customStatus, socials, createdAt FROM User WHERE id = ?",
+            "SELECT id, username, displayName, email, avatar, banner, status, bio, pronouns, \
+             profileColor, badges, customStatus, socials, createdAt FROM User WHERE id = ?",
         )
         .bind(&user_id)
         .fetch_optional(&state.db)

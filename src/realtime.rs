@@ -588,7 +588,9 @@ async fn ev_dm_call_dial(st: AppState, socket: SocketRef, v: Value) {
         .to(receiver_id.clone())
         .emit("dm_call_incoming", &json!({ "caller": caller, "roomId": room_id }));
 
-    if let Some(payload) = create_dm(&st, &user_id, &receiver_id, "📞 Начал звонок").await {
+    // Stored as a sentinel, not user-authored text: the client renders it as a
+    // centered system line rather than a message from the caller.
+    if let Some(payload) = create_dm(&st, &user_id, &receiver_id, "__akami_call_started__").await {
         st.emit_to(&receiver_id, "dm_received", payload.clone());
         st.emit_to(&user_id, "dm_received", payload);
     }
