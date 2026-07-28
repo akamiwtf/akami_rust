@@ -115,6 +115,15 @@ where
     Deserialize::deserialize(de).map(Some)
 }
 
+/// Same three-state helper, for shapes outside this module.
+pub fn double_option_pub<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    double_option(de)
+}
+
 /// Field missing = keep, explicit null = clear, value = set.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

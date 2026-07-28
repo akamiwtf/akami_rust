@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod crypto;
 mod db;
+mod messages;
 mod middleware;
 mod models;
 mod realtime;
@@ -18,7 +19,7 @@ use std::fs;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use socketioxide::SocketIo;
-use tower_http::{cors::CorsLayer, services::ServeDir};
+use tower_http::cors::CorsLayer;
 
 use config::Config;
 
@@ -50,10 +51,13 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .merge(routes::api_router())
-        .nest_service("/uploads", ServeDir::new("uploads"))
+        .nest("/uploads", routes::uploads_router())
         .layer(socket_layer)
         .layer(CorsLayer::permissive())
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        // Uploads arrive as base64 inside JSON, which inflates a file by a third.
+        // Attachments are capped at 50 MB and never re-encoded, so the body has to
+        // hold ~67 MB; 96 MiB leaves headroom for the rest of the JSON.
+        .layer(DefaultBodyLimit::max(96 * 1024 * 1024))
         .with_state(app_state);
 
     let addr = format!("0.0.0.0:{}", config.port);

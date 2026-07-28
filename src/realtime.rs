@@ -12,6 +12,8 @@ use sqlx::FromRow;
 
 use crate::auth;
 use crate::db::{new_id, now_db, sql};
+use crate::messages;
+use crate::messages::forwarded_author;
 use crate::models::{DirectMessage, Message, PublicUser, PUBLIC_USER_COLS};
 use crate::state::{AppState, Broadcaster, EmitTarget};
 use crate::voice::now_ms;
@@ -145,6 +147,11 @@ async fn on_connect(socket: SocketRef, Data(auth_data): Data<AuthData>, State(st
     on_event!(socket, st, "profile_updated", ev_profile_updated);
     on_event!(socket, st, "send_message", ev_send_message);
     on_event!(socket, st, "edit_message", ev_edit_message);
+    on_event!(socket, st, "edit_dm", ev_edit_dm);
+    on_event!(socket, st, "delete_message", ev_delete_message);
+    on_event!(socket, st, "delete_dm", ev_delete_dm);
+    on_event!(socket, st, "toggle_reaction", ev_toggle_reaction);
+    on_event!(socket, st, "toggle_pin", ev_toggle_pin);
     on_event!(socket, st, "button_click", ev_button_click);
     // --- DMs & calls ---
     on_event!(socket, st, "send_dm", ev_send_dm);
@@ -229,9 +236,12 @@ async fn ev_join_voice(st: AppState, socket: SocketRef, v: Value) {
     let others = st.voice.other_socket_ids(&channel_id, &sid);
     let _ = socket.emit("voice_users_list", &others);
 
+    // `.await`ed on purpose: a broadcast emit is a future and does nothing until
+    // polled, so dropping it would silently swallow the event.
     let _ = socket
         .to(room.clone())
-        .emit("user_joined_voice", &json!({ "socketId": sid, "userId": user_id }));
+        .emit("user_joined_voice", &json!({ "socketId": sid, "userId": user_id }))
+        .await;
 
     st.emit_all("voice_state_sync", st.voice.snapshot());
 
@@ -249,7 +259,8 @@ async fn ev_leave_voice(st: AppState, socket: SocketRef, v: Value) {
     socket.leave(room.clone());
     let _ = socket
         .to(room)
-        .emit("user_left_voice", &json!({ "socketId": sid, "userId": user_id }));
+        .emit("user_left_voice", &json!({ "socketId": sid, "userId": user_id }))
+        .await;
 
     if st.voice.remove_socket(&sid) {
         st.emit_all("voice_state_sync", st.voice.snapshot());
@@ -386,15 +397,41 @@ async fn ev_send_message(st: AppState, socket: SocketRef, v: Value) {
     };
     let now = now_db();
 
+    // A reply only counts if the answered message is really in this channel —
+    // otherwise the quote would point somewhere the reader cannot see.
+    let reply_to_id = match str_field(&v, "replyToId") {
+        Some(rid) => {
+            let found: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM Message WHERE id = ? AND channelId = ?")
+                    .bind(&rid)
+                    .bind(&channel_id)
+                    .fetch_optional(&st.db)
+                    .await
+                    .ok()
+                    .flatten();
+            found.map(|(id,)| id)
+        }
+        None => None,
+    };
+
+    // Forwarding: the id of the message it came from decides whose name is shown,
+    // so a client cannot make up an author.
+    let forwarded_from = match str_field(&v, "forwardedFromId") {
+        Some(source) => messages::forwarded_author(&st, &source).await,
+        None => None,
+    };
+
     if sqlx::query(
-        "INSERT INTO Message (id, content, components, userId, channelId, createdAt, updatedAt) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO Message (id, content, components, userId, channelId, replyToId, forwardedFrom, createdAt, updatedAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&content)
     .bind(&components_str)
     .bind(&user_id)
     .bind(&channel_id)
+    .bind(&reply_to_id)
+    .bind(&forwarded_from)
     .bind(&now)
     .bind(&now)
     .execute(&st.db)
@@ -418,6 +455,14 @@ async fn ev_send_message(st: AppState, socket: SocketRef, v: Value) {
     let mut payload = serde_json::to_value(&msg).unwrap();
     payload["components"] = components_in.unwrap_or(Value::Null);
     payload["user"] = serde_json::to_value(&user).unwrap();
+    if let Some(rid) = &reply_to_id {
+        payload["replyTo"] = messages::reply_preview(&st, rid, false)
+            .await
+            .unwrap_or(Value::Null);
+    }
+    if let Some(author) = &forwarded_from {
+        payload["forwardedFromUser"] = messages::forwarded_label(&st, author).await;
+    }
     st.emit_to(&channel_id, "message_received", payload);
 }
 
@@ -484,6 +529,200 @@ async fn ev_edit_message(st: AppState, socket: SocketRef, v: Value) {
     st.emit_to(&existing.channel_id, "message_updated", payload);
 }
 
+/// Deleting one's own channel message. Only the author may — a server owner has no
+/// say over someone else's words here, same rule as editing.
+async fn ev_delete_message(st: AppState, socket: SocketRef, v: Value) {
+    let Some(user_id) = uid(&socket) else { return };
+    let Some(message_id) = str_field(&v, "messageId") else { return };
+
+    let Some(existing): Option<Message> = sqlx::query_as("SELECT * FROM Message WHERE id = ?")
+        .bind(&message_id)
+        .fetch_optional(&st.db)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    if existing.user_id != user_id {
+        return;
+    }
+
+    if sqlx::query("DELETE FROM Message WHERE id = ?")
+        .bind(&message_id)
+        .execute(&st.db)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    messages::clear_reactions(&st, &message_id).await;
+
+    st.emit_to(
+        &existing.channel_id,
+        "message_deleted",
+        json!({ "id": message_id, "channelId": existing.channel_id }),
+    );
+}
+
+/// Same for a direct message: the author drops it, and both sides are told.
+async fn ev_delete_dm(st: AppState, socket: SocketRef, v: Value) {
+    let Some(user_id) = uid(&socket) else { return };
+    let Some(message_id) = str_field(&v, "messageId") else { return };
+
+    let Some(existing): Option<DirectMessage> =
+        sqlx::query_as("SELECT * FROM DirectMessage WHERE id = ?")
+            .bind(&message_id)
+            .fetch_optional(&st.db)
+            .await
+            .ok()
+            .flatten()
+    else {
+        return;
+    };
+    if existing.sender_id != user_id {
+        return;
+    }
+
+    if sqlx::query("DELETE FROM DirectMessage WHERE id = ?")
+        .bind(&message_id)
+        .execute(&st.db)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    messages::clear_reactions(&st, &message_id).await;
+
+    let payload = json!({
+        "id": message_id,
+        "senderId": existing.sender_id,
+        "receiverId": existing.receiver_id,
+    });
+    st.emit_to(&existing.receiver_id, "dm_deleted", payload.clone());
+    st.emit_to(&existing.sender_id, "dm_deleted", payload);
+}
+
+/// Adding or taking back a reaction. Anyone who can see the message may react,
+/// and everyone who can see it is told — which is why the message has to be
+/// located first: a channel one goes to the channel, a direct one to both sides.
+async fn ev_toggle_reaction(st: AppState, socket: SocketRef, v: Value) {
+    let Some(user_id) = uid(&socket) else { return };
+    let Some(message_id) = str_field(&v, "messageId") else { return };
+    let Some(emoji) = str_field(&v, "emoji") else { return };
+    // A single character or two (an emoji may be a surrogate pair plus a
+    // variation selector); anything longer is not an emoji.
+    if emoji.trim().is_empty() || emoji.chars().count() > 8 {
+        return;
+    }
+
+    let Some(kind) = messages::locate(&st, &message_id).await else { return };
+    let Some(reactions) = messages::toggle_reaction(&st, &message_id, &user_id, &emoji).await else {
+        return;
+    };
+
+    let payload = json!({ "messageId": message_id, "reactions": reactions });
+    match kind {
+        messages::MessageKind::Channel { channel_id } => {
+            st.emit_to(&channel_id, "reaction_updated", payload);
+        }
+        messages::MessageKind::Direct {
+            sender_id,
+            receiver_id,
+        } => {
+            st.emit_to(&receiver_id, "reaction_updated", payload.clone());
+            st.emit_to(&sender_id, "reaction_updated", payload);
+        }
+    }
+}
+
+/// Pinning, and unpinning by pinning again. Not limited to the author: anyone in
+/// the conversation may pin, since a pin marks what the conversation cares about
+/// rather than what one person wrote.
+async fn ev_toggle_pin(st: AppState, socket: SocketRef, v: Value) {
+    let Some(user_id) = uid(&socket) else { return };
+    let Some(message_id) = str_field(&v, "messageId") else { return };
+
+    let Some(kind) = messages::locate(&st, &message_id).await else { return };
+
+    // Whoever pins has to be able to see the message in the first place.
+    let table = match &kind {
+        messages::MessageKind::Channel { channel_id } => {
+            let server_id: Option<(String,)> =
+                sqlx::query_as("SELECT serverId FROM Channel WHERE id = ?")
+                    .bind(channel_id)
+                    .fetch_optional(&st.db)
+                    .await
+                    .ok()
+                    .flatten();
+            let Some((server_id,)) = server_id else { return };
+            let is_member: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM ServerMember WHERE serverId = ? AND userId = ?")
+                    .bind(&server_id)
+                    .bind(&user_id)
+                    .fetch_optional(&st.db)
+                    .await
+                    .ok()
+                    .flatten();
+            if is_member.is_none() {
+                return;
+            }
+            "Message"
+        }
+        messages::MessageKind::Direct {
+            sender_id,
+            receiver_id,
+        } => {
+            if *sender_id != user_id && *receiver_id != user_id {
+                return;
+            }
+            "DirectMessage"
+        }
+    };
+
+    let current: Option<(Option<String>,)> = sqlx::query_as(sql(format!(
+        r#"SELECT "pinnedAt" FROM "{table}" WHERE id = ?"#
+    )))
+    .bind(&message_id)
+    .fetch_optional(&st.db)
+    .await
+    .ok()
+    .flatten();
+    let Some((current,)) = current else { return };
+
+    let pinned_at = match current {
+        Some(_) => None,
+        None => Some(now_db()),
+    };
+    if sqlx::query(sql(format!(
+        r#"UPDATE "{table}" SET "pinnedAt" = ? WHERE id = ?"#
+    )))
+    .bind(&pinned_at)
+    .bind(&message_id)
+    .execute(&st.db)
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    let payload = json!({ "messageId": message_id, "pinnedAt": pinned_at });
+    match kind {
+        messages::MessageKind::Channel { channel_id } => {
+            st.emit_to(&channel_id, "pin_updated", payload);
+        }
+        messages::MessageKind::Direct {
+            sender_id,
+            receiver_id,
+        } => {
+            st.emit_to(&receiver_id, "pin_updated", payload.clone());
+            st.emit_to(&sender_id, "pin_updated", payload);
+        }
+    }
+}
+
 async fn ev_button_click(st: AppState, socket: SocketRef, v: Value) {
     let Some(user_id) = uid(&socket) else { return };
     let Some(message_id) = str_field(&v, "messageId") else { return };
@@ -533,18 +772,54 @@ async fn load_public_user(st: &AppState, id: &str) -> Option<PublicUser> {
 
 /// Inserts an (already-encrypted) DM and returns the client payload with the
 /// decrypted content and both user objects included.
-async fn create_dm(st: &AppState, sender_id: &str, receiver_id: &str, plain: &str) -> Option<Value> {
+async fn create_dm(
+    st: &AppState,
+    sender_id: &str,
+    receiver_id: &str,
+    plain: &str,
+    reply_to_id: Option<String>,
+    forwarded_from_id: Option<String>,
+) -> Option<Value> {
     let encrypted = st.dm_crypto.encrypt(plain);
     let id = new_id();
     let now = now_db();
+
+    // Only a message from this very conversation may be quoted.
+    let reply_to_id = match reply_to_id {
+        Some(rid) => {
+            let found: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM DirectMessage WHERE id = ? \
+                 AND ((senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?))",
+            )
+            .bind(&rid)
+            .bind(sender_id)
+            .bind(receiver_id)
+            .bind(receiver_id)
+            .bind(sender_id)
+            .fetch_optional(&st.db)
+            .await
+            .ok()
+            .flatten();
+            found.map(|(id,)| id)
+        }
+        None => None,
+    };
+
+    let forwarded_from = match forwarded_from_id {
+        Some(source) => forwarded_author(st, &source).await,
+        None => None,
+    };
+
     sqlx::query(
-        "INSERT INTO DirectMessage (id, content, senderId, receiverId, createdAt) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO DirectMessage (id, content, senderId, receiverId, replyToId, forwardedFrom, createdAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&encrypted)
     .bind(sender_id)
     .bind(receiver_id)
+    .bind(&reply_to_id)
+    .bind(&forwarded_from)
     .bind(&now)
     .execute(&st.db)
     .await
@@ -562,6 +837,14 @@ async fn create_dm(st: &AppState, sender_id: &str, receiver_id: &str, plain: &st
     payload["content"] = json!(plain);
     payload["sender"] = serde_json::to_value(&sender).unwrap();
     payload["receiver"] = serde_json::to_value(&receiver).unwrap();
+    if let Some(rid) = &reply_to_id {
+        payload["replyTo"] = messages::reply_preview(st, rid, true)
+            .await
+            .unwrap_or(Value::Null);
+    }
+    if let Some(author) = &forwarded_from {
+        payload["forwardedFromUser"] = messages::forwarded_label(st, author).await;
+    }
     Some(payload)
 }
 
@@ -572,10 +855,63 @@ async fn ev_send_dm(st: AppState, socket: SocketRef, v: Value) {
     if content.trim().is_empty() {
         return;
     }
-    if let Some(payload) = create_dm(&st, &user_id, &receiver_id, &content).await {
+    let reply_to_id = str_field(&v, "replyToId");
+    let forwarded_from_id = str_field(&v, "forwardedFromId");
+    if let Some(payload) =
+        create_dm(&st, &user_id, &receiver_id, &content, reply_to_id, forwarded_from_id).await
+    {
         st.emit_to(&receiver_id, "dm_received", payload.clone());
         st.emit_to(&user_id, "dm_received", payload);
     }
+}
+
+/// Editing one's own direct message. Only the author may, and only the text —
+/// `updatedAt` is what tells the clients it was edited.
+async fn ev_edit_dm(st: AppState, socket: SocketRef, v: Value) {
+    let Some(user_id) = uid(&socket) else { return };
+    let Some(message_id) = str_field(&v, "messageId") else { return };
+    let Some(content) = str_field(&v, "content") else { return };
+    if content.trim().is_empty() {
+        return;
+    }
+
+    let Some(existing): Option<DirectMessage> =
+        sqlx::query_as("SELECT * FROM DirectMessage WHERE id = ?")
+            .bind(&message_id)
+            .fetch_optional(&st.db)
+            .await
+            .ok()
+            .flatten()
+    else {
+        return;
+    };
+    if existing.sender_id != user_id {
+        return;
+    }
+
+    let now = now_db();
+    if sqlx::query("UPDATE DirectMessage SET content = ?, updatedAt = ? WHERE id = ?")
+        .bind(st.dm_crypto.encrypt(&content))
+        .bind(&now)
+        .bind(&message_id)
+        .execute(&st.db)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // The stored text is encrypted, so the payload carries the plain text the
+    // author just sent, exactly as `create_dm` does.
+    let payload = json!({
+        "id": existing.id,
+        "senderId": existing.sender_id,
+        "receiverId": existing.receiver_id,
+        "content": content,
+        "updatedAt": now,
+    });
+    st.emit_to(&existing.receiver_id, "dm_updated", payload.clone());
+    st.emit_to(&existing.sender_id, "dm_updated", payload);
 }
 
 async fn ev_dm_call_dial(st: AppState, socket: SocketRef, v: Value) {
@@ -586,11 +922,14 @@ async fn ev_dm_call_dial(st: AppState, socket: SocketRef, v: Value) {
 
     let _ = socket
         .to(receiver_id.clone())
-        .emit("dm_call_incoming", &json!({ "caller": caller, "roomId": room_id }));
+        .emit("dm_call_incoming", &json!({ "caller": caller, "roomId": room_id }))
+        .await;
 
     // Stored as a sentinel, not user-authored text: the client renders it as a
     // centered system line rather than a message from the caller.
-    if let Some(payload) = create_dm(&st, &user_id, &receiver_id, "__akami_call_started__").await {
+    if let Some(payload) =
+        create_dm(&st, &user_id, &receiver_id, "__akami_call_started__", None, None).await
+    {
         st.emit_to(&receiver_id, "dm_received", payload.clone());
         st.emit_to(&user_id, "dm_received", payload);
     }
@@ -601,17 +940,24 @@ async fn ev_dm_call_accept(_st: AppState, socket: SocketRef, v: Value) {
     let room_id = v.get("roomId").cloned().unwrap_or(Value::Null);
     let _ = socket
         .to(caller_id)
-        .emit("dm_call_accepted", &json!({ "roomId": room_id }));
+        .emit("dm_call_accepted", &json!({ "roomId": room_id }))
+        .await;
 }
 
 async fn ev_dm_call_decline(_st: AppState, socket: SocketRef, v: Value) {
     let Some(caller_id) = str_field(&v, "callerId") else { return };
-    let _ = socket.to(caller_id).emit("dm_call_declined", &Value::Null);
+    let _ = socket
+        .to(caller_id)
+        .emit("dm_call_declined", &Value::Null)
+        .await;
 }
 
 async fn ev_dm_call_hangup(_st: AppState, socket: SocketRef, v: Value) {
     let Some(receiver_id) = str_field(&v, "receiverId") else { return };
-    let _ = socket.to(receiver_id).emit("dm_call_hungup", &Value::Null);
+    let _ = socket
+        .to(receiver_id)
+        .emit("dm_call_hungup", &Value::Null)
+        .await;
 }
 
 async fn ev_update_status(st: AppState, socket: SocketRef, v: Value) {

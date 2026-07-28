@@ -28,11 +28,53 @@ pub async fn connect(database_url: &str) -> Result<Db, sqlx::Error> {
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
 /// existing databases alone, so each one is added here if absent — `ADD COLUMN`
 /// errors when the column is already there, hence the pragma check.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
-    "User",
-    "profileColor",
-    r#"ALTER TABLE "User" ADD COLUMN "profileColor" TEXT NOT NULL DEFAULT ''"#,
-)];
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "User",
+        "profileColor",
+        r#"ALTER TABLE "User" ADD COLUMN "profileColor" TEXT NOT NULL DEFAULT ''"#,
+    ),
+    (
+        "DirectMessage",
+        "updatedAt",
+        r#"ALTER TABLE "DirectMessage" ADD COLUMN "updatedAt" DATETIME"#,
+    ),
+    (
+        "Message",
+        "replyToId",
+        r#"ALTER TABLE "Message" ADD COLUMN "replyToId" TEXT"#,
+    ),
+    (
+        "DirectMessage",
+        "replyToId",
+        r#"ALTER TABLE "DirectMessage" ADD COLUMN "replyToId" TEXT"#,
+    ),
+    (
+        "Message",
+        "pinnedAt",
+        r#"ALTER TABLE "Message" ADD COLUMN "pinnedAt" DATETIME"#,
+    ),
+    (
+        "DirectMessage",
+        "pinnedAt",
+        r#"ALTER TABLE "DirectMessage" ADD COLUMN "pinnedAt" DATETIME"#,
+    ),
+    (
+        "Message",
+        "forwardedFrom",
+        r#"ALTER TABLE "Message" ADD COLUMN "forwardedFrom" TEXT"#,
+    ),
+    (
+        "DirectMessage",
+        "forwardedFrom",
+        r#"ALTER TABLE "DirectMessage" ADD COLUMN "forwardedFrom" TEXT"#,
+    ),
+    (
+        "Server",
+        "bannerUrl",
+        r#"ALTER TABLE "Server" ADD COLUMN "bannerUrl" TEXT"#,
+    ),
+];
 
 async fn add_missing_columns(pool: &Db) -> Result<(), sqlx::Error> {
     for (table, column, ddl) in ADDED_COLUMNS {

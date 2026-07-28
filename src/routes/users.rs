@@ -506,11 +506,17 @@ pub async fn user_badges(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DmResponse {
     #[serde(flatten)]
     dm: DirectMessage,
     sender: DmUser,
     receiver: DmUser,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<Value>,
+    reactions: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarded_from_user: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -564,10 +570,22 @@ pub async fn user_dms(
         dm.content = st.dm_crypto.decrypt(&dm.content);
         let sender = load_dm_user(&st, &dm.sender_id).await?;
         let receiver = load_dm_user(&st, &dm.receiver_id).await?;
+        let reply_to = match &dm.reply_to_id {
+            Some(rid) => crate::messages::reply_preview(&st, rid, true).await,
+            None => None,
+        };
+        let reactions = crate::messages::reactions_for(&st, &dm.id).await;
+        let forwarded_from_user = match &dm.forwarded_from {
+            Some(author) => Some(crate::messages::forwarded_label(&st, author).await),
+            None => None,
+        };
         out.push(DmResponse {
             dm,
             sender,
             receiver,
+            reply_to,
+            reactions,
+            forwarded_from_user,
         });
     }
     Ok(Json(json!(out)))
